@@ -1,9 +1,6 @@
 package model
 
 import (
-	"fmt"
-
-	"x-ui/util/json_util"
 	"x-ui/xray"
 )
 
@@ -67,22 +64,8 @@ type HistoryOfSeeders struct {
 	SeederName string `json:"seederName"`
 }
 
-func (i *Inbound) GenXrayInboundConfig() *xray.InboundConfig {
-	listen := i.Listen
-	if listen != "" {
-		listen = fmt.Sprintf("\"%v\"", listen)
-	}
-	return &xray.InboundConfig{
-		Listen:         json_util.RawMessage(listen),
-		Port:           i.Port,
-		Protocol:       string(i.Protocol),
-		Settings:       json_util.RawMessage(i.Settings),
-		StreamSettings: json_util.RawMessage(i.StreamSettings),
-		Tag:            i.Tag,
-		Sniffing:       json_util.RawMessage(i.Sniffing),
-		Allocate:       json_util.RawMessage(i.Allocate),
-	}
-}
+// GenXrayInboundConfig method moved to avoid circular import
+// This method should be implemented in a service layer instead
 
 type Setting struct {
 	Id    int    `json:"id" form:"id" gorm:"primaryKey;autoIncrement"`
@@ -106,4 +89,6 @@ type Client struct {
 	Reset      int    `json:"reset" form:"reset"`
 	MaxDevices int    `json:"maxDevices" form:"maxDevices" gorm:"default:0"` // 新增：最大设备数量限制, 0表示不限制
 	ActiveIPs  string `json:"activeIPs" form:"activeIPs" gorm:"type:text"`   // 新增：当前活动的IP列表 (JSON字符串)
+	DeviceFingerprints string `json:"deviceFingerprints" form:"deviceFingerprints" gorm:"type:text"` // 设备指纹信息 (JSON字符串)
+	FingerprintMode    string `json:"fingerprintMode" form:"fingerprintMode" gorm:"default:ip"`     // 识别模式：ip/fingerprint/hybrid
 }

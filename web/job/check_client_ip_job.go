@@ -2,19 +2,23 @@ package job
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"os"
 	"os/exec"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"slices"
 	"x-ui/database"
-	"x-ui/web/service"
 	"x-ui/database/model"
+	"x-ui/web/service"
 	"x-ui/logger"
 	"x-ui/xray"
 )
@@ -22,6 +26,16 @@ import (
 type CheckClientIpJob struct {
 	lastClear     int64
 	disAllowedIps []string
+}
+
+// DeviceFingerprint 设备指纹结构体
+type DeviceFingerprint struct {
+	ID             string    `json:"id"`             // 设备唯一标识
+	UserAgent      string    `json:"userAgent"`      // User-Agent字符串
+	TLSFingerprint string    `json:"tlsFingerprint"` // TLS指纹
+	FirstSeen      time.Time `json:"firstSeen"`      // 首次出现时间
+	LastSeen       time.Time `json:"lastSeen"`       // 最后活跃时间
+	IPAddresses    []string  `json:"ipAddresses"`    // 关联的IP地址列表
 }
 
 var job *CheckClientIpJob
@@ -111,12 +125,17 @@ func (j *CheckClientIpJob) processLogFile() bool {
 
 	ipRegex := regexp.MustCompile(`from (?:tcp:|udp:)?\[?([0-9a-fA-F\.:]+)\]?:\d+ accepted`)
 	emailRegex := regexp.MustCompile(`email: (.+)$`)
+	// 添加User-Agent和TLS指纹的正则表达式
+	userAgentRegex := regexp.MustCompile(`user-agent: ([^\s]+)`)
+	tlsFingerprintRegex := regexp.MustCompile(`tls-fingerprint: ([^\s]+)`)
 
 	accessLogPath, _ := xray.GetAccessLogPath()
 	file, _ := os.Open(accessLogPath)
 	defer file.Close()
 
 	inboundClientIps := make(map[string]map[string]struct{}, 100)
+	// 添加设备指纹映射
+	inboundClientFingerprints := make(map[string]map[string]*DeviceFingerprint, 100)
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -139,10 +158,48 @@ func (j *CheckClientIpJob) processLogFile() bool {
 		}
 		email := emailMatches[1]
 
+		// 提取User-Agent和TLS指纹
+		userAgent := ""
+		tlsFingerprint := ""
+		if uaMatches := userAgentRegex.FindStringSubmatch(line); len(uaMatches) >= 2 {
+			userAgent = uaMatches[1]
+		}
+		if tlsMatches := tlsFingerprintRegex.FindStringSubmatch(line); len(tlsMatches) >= 2 {
+			tlsFingerprint = tlsMatches[1]
+		}
+
+		// 生成设备指纹ID
+		deviceID := j.generateDeviceFingerprint(userAgent, tlsFingerprint)
+
+		// 存储IP映射（保持原有逻辑）
 		if _, exists := inboundClientIps[email]; !exists {
 			inboundClientIps[email] = make(map[string]struct{})
 		}
 		inboundClientIps[email][ip] = struct{}{}
+
+		// 存储设备指纹映射
+		if userAgent != "" || tlsFingerprint != "" {
+			if _, exists := inboundClientFingerprints[email]; !exists {
+				inboundClientFingerprints[email] = make(map[string]*DeviceFingerprint)
+			}
+			if fingerprint, exists := inboundClientFingerprints[email][deviceID]; exists {
+				// 更新现有指纹
+				fingerprint.LastSeen = time.Now()
+				if !j.contains(fingerprint.IPAddresses, ip) {
+					fingerprint.IPAddresses = append(fingerprint.IPAddresses, ip)
+				}
+			} else {
+				// 创建新指纹
+				inboundClientFingerprints[email][deviceID] = &DeviceFingerprint{
+					ID:             deviceID,
+					UserAgent:      userAgent,
+					TLSFingerprint: tlsFingerprint,
+					FirstSeen:      time.Now(),
+					LastSeen:       time.Now(),
+					IPAddresses:    []string{ip},
+				}
+			}
+		}
 	}
 
 	shouldCleanLog := false
@@ -198,6 +255,14 @@ func (j *CheckClientIpJob) processLogFile() bool {
 		}
 		sort.Strings(currentLoggedIps)
 
+		// 获取当前客户端的设备指纹
+		currentFingerprints := make([]*DeviceFingerprint, 0)
+		if clientFingerprints, exists := inboundClientFingerprints[email]; exists {
+			for _, fingerprint := range clientFingerprints {
+				currentFingerprints = append(currentFingerprints, fingerprint)
+			}
+		}
+
 		clientIpsRecord, err := j.getInboundClientIps(email) // This function likely needs to be adapted or clientData used directly
 
 		activeIPs := []string{}
@@ -213,24 +278,73 @@ func (j *CheckClientIpJob) processLogFile() bool {
 		copy(newActiveIPs, activeIPs)
 		changedActiveIPs := false
 
-		for _, loggedIp := range currentLoggedIps {
-			isExistingActiveIP := j.contains(newActiveIPs, loggedIp)
-
-			if clientData.MaxDevices > 0 {
-				if !isExistingActiveIP {
-					if len(newActiveIPs) < clientData.MaxDevices {
-						newActiveIPs = append(newActiveIPs, loggedIp)
-						changedActiveIPs = true
-					} else {
-						if !j.contains(j.disAllowedIps, loggedIp) {
-							j.disAllowedIps = append(j.disAllowedIps, loggedIp)
-							logger.Infof("[MaxDevices] IP %s for client %s banned due to exceeding max device limit (%d)", loggedIp, email, clientData.MaxDevices)
-							shouldCleanLog = true
+		// 根据指纹模式处理设备限制
+		if clientData.MaxDevices > 0 {
+			switch clientData.FingerprintMode {
+			case "fingerprint":
+				// 基于设备指纹的限制
+				if len(currentFingerprints) > clientData.MaxDevices {
+					// 超出设备限制，封禁多余设备的所有IP
+					for i := clientData.MaxDevices; i < len(currentFingerprints); i++ {
+						for _, ip := range currentFingerprints[i].IPAddresses {
+							if !j.contains(j.disAllowedIps, ip) {
+								j.disAllowedIps = append(j.disAllowedIps, ip)
+								logger.Infof("[MaxDevices-Fingerprint] IP %s for client %s banned due to exceeding max device limit (%d)", ip, email, clientData.MaxDevices)
+								shouldCleanLog = true
+							}
 						}
 					}
 				}
-			} // End MaxDevices check
-		} // End loop currentLoggedIps
+			case "hybrid":
+				// 混合模式：优先使用指纹，回退到IP
+				if len(currentFingerprints) > 0 {
+					if len(currentFingerprints) > clientData.MaxDevices {
+						for i := clientData.MaxDevices; i < len(currentFingerprints); i++ {
+							for _, ip := range currentFingerprints[i].IPAddresses {
+								if !j.contains(j.disAllowedIps, ip) {
+									j.disAllowedIps = append(j.disAllowedIps, ip)
+									logger.Infof("[MaxDevices-Hybrid] IP %s for client %s banned due to exceeding max device limit (%d)", ip, email, clientData.MaxDevices)
+									shouldCleanLog = true
+								}
+							}
+						}
+					} else {
+						// 回退到IP模式
+						for _, loggedIp := range currentLoggedIps {
+							isExistingActiveIP := j.contains(newActiveIPs, loggedIp)
+							if !isExistingActiveIP {
+								if len(newActiveIPs) < clientData.MaxDevices {
+									newActiveIPs = append(newActiveIPs, loggedIp)
+									changedActiveIPs = true
+								} else {
+									if !j.contains(j.disAllowedIps, loggedIp) {
+										j.disAllowedIps = append(j.disAllowedIps, loggedIp)
+										logger.Infof("[MaxDevices-Hybrid-IP] IP %s for client %s banned due to exceeding max device limit (%d)", loggedIp, email, clientData.MaxDevices)
+										shouldCleanLog = true
+									}
+								}
+							}
+						}
+					}
+			default:
+				// 默认IP模式（保持原有逻辑）
+				for _, loggedIp := range currentLoggedIps {
+					isExistingActiveIP := j.contains(newActiveIPs, loggedIp)
+					if !isExistingActiveIP {
+						if len(newActiveIPs) < clientData.MaxDevices {
+							newActiveIPs = append(newActiveIPs, loggedIp)
+							changedActiveIPs = true
+						} else {
+							if !j.contains(j.disAllowedIps, loggedIp) {
+								j.disAllowedIps = append(j.disAllowedIps, loggedIp)
+								logger.Infof("[MaxDevices] IP %s for client %s banned due to exceeding max device limit (%d)", loggedIp, email, clientData.MaxDevices)
+								shouldCleanLog = true
+							}
+						}
+					}
+				}
+			}
+		}
 
 		if changedActiveIPs {
 			activeIPsBytes, marshalErr := json.Marshal(newActiveIPs)
@@ -250,6 +364,14 @@ func (j *CheckClientIpJob) processLogFile() bool {
 				if dbUpdateErr != nil {
 					logger.Warningf("Failed to update ActiveIPs in DB for client %s: %v", email, dbUpdateErr)
 				}
+			}
+		}
+
+		// 更新设备指纹数据到数据库
+		if len(currentFingerprints) > 0 {
+			err := j.updateClientDeviceFingerprints(clientInboundID, email, currentFingerprints)
+			if err != nil {
+				logger.Warningf("Failed to update device fingerprints for client %s: %v", email, err)
 			}
 		}
 
@@ -296,6 +418,66 @@ func (j *CheckClientIpJob) checkError(e error) {
 
 func (j *CheckClientIpJob) contains(s []string, str string) bool {
 	return slices.Contains(s, str)
+}
+
+// generateDeviceFingerprint 生成设备指纹ID
+func (j *CheckClientIpJob) generateDeviceFingerprint(userAgent, tlsFingerprint string) string {
+	if userAgent == "" && tlsFingerprint == "" {
+		return ""
+	}
+	
+	// 组合User-Agent和TLS指纹
+	combined := fmt.Sprintf("%s|%s", userAgent, tlsFingerprint)
+	
+	// 生成SHA-256哈希
+	hash := sha256.Sum256([]byte(combined))
+	return hex.EncodeToString(hash[:])
+}
+
+// updateClientDeviceFingerprints 更新客户端设备指纹到数据库
+func (j *CheckClientIpJob) updateClientDeviceFingerprints(clientInboundID int, email string, fingerprints []*DeviceFingerprint) error {
+	if len(fingerprints) == 0 {
+		return nil
+	}
+	
+	// 序列化设备指纹数据
+	fingerprintsBytes, err := json.Marshal(fingerprints)
+	if err != nil {
+		return fmt.Errorf("failed to marshal device fingerprints: %v", err)
+	}
+	
+	// 更新数据库
+	inboundService := service.InboundService{}
+	err = inboundService.UpdateClientDeviceFingerprintsInDB(clientInboundID, email, string(fingerprintsBytes))
+	if err != nil {
+		return fmt.Errorf("failed to update device fingerprints in DB: %v", err)
+	}
+	
+	logger.Infof("Client %s device fingerprints updated: %d devices", email, len(fingerprints))
+	return nil
+}
+
+// normalizeUserAgent 标准化User-Agent字符串
+func (j *CheckClientIpJob) normalizeUserAgent(userAgent string) string {
+	if userAgent == "" {
+		return ""
+	}
+	
+	// 转换为小写并去除多余空格
+	normalized := strings.ToLower(strings.TrimSpace(userAgent))
+	
+	// 移除版本号中的具体数字，保留主要特征
+	// 例如：Chrome/91.0.4472.124 -> Chrome/91.x.x.x
+	versionRegex := regexp.MustCompile(`(\d+\.)(\d+\.)+(\d+)`)
+	normalized = versionRegex.ReplaceAllStringFunc(normalized, func(match string) string {
+		parts := strings.Split(match, ".")
+		if len(parts) > 1 {
+			return parts[0] + ".x.x.x"
+		}
+		return match
+	})
+	
+	return normalized
 }
 
 func (j *CheckClientIpJob) getInboundClientIps(clientEmail string) (*model.InboundClientIps, error) {

@@ -12,6 +12,7 @@ import (
 	"x-ui/database/model"
 	"x-ui/logger"
 	"x-ui/util/common"
+	"x-ui/util/json_util"
 	"x-ui/xray"
 
 	"gorm.io/gorm"
@@ -19,6 +20,24 @@ import (
 
 type InboundService struct {
 	xrayApi xray.XrayAPI
+}
+
+// genXrayInboundConfig generates xray.InboundConfig from model.Inbound
+func (s *InboundService) genXrayInboundConfig(i *model.Inbound) *xray.InboundConfig {
+	listen := i.Listen
+	if listen != "" {
+		listen = fmt.Sprintf("\"%v\"", listen)
+	}
+	return &xray.InboundConfig{
+		Listen:         json_util.RawMessage(listen),
+		Port:           i.Port,
+		Protocol:       string(i.Protocol),
+		Settings:       json_util.RawMessage(i.Settings),
+		StreamSettings: json_util.RawMessage(i.StreamSettings),
+		Tag:            i.Tag,
+		Sniffing:       json_util.RawMessage(i.Sniffing),
+		Allocate:       json_util.RawMessage(i.Allocate),
+	}
 }
 
 func (s *InboundService) UpdateClientActiveIPsInDB(inboundID int, clientIdentifier string, newActiveIPsJSON string) error {
@@ -101,7 +120,94 @@ func (s *InboundService) UpdateClientActiveIPsInDB(inboundID int, clientIdentifi
 		return fmt.Errorf("error saving updated inbound settings for ID %d: %w", inboundID, err)
 	}
 
-	logger.Infof("Successfully updated ActiveIPs for client '%s' in inbound ID %d", clientIdentifier, inboundID)
+	return nil
+}
+
+	return nil
+}
+
+// UpdateClientDeviceFingerprintsInDB 更新客户端设备指纹到数据库
+func (s *InboundService) UpdateClientDeviceFingerprintsInDB(inboundID int, clientIdentifier string, deviceFingerprintsJSON string) error {
+	db := database.GetDB()
+	var inbound model.Inbound
+	err := db.First(&inbound, inboundID).Error
+	if err != nil {
+		return fmt.Errorf("inbound with ID %d not found: %w", inboundID, err)
+	}
+
+	if inbound.Settings == "" {
+		return fmt.Errorf("inbound settings for ID %d are empty", inboundID)
+	}
+
+	settingsMap := make(map[string]interface{})
+	err = json.Unmarshal([]byte(inbound.Settings), &settingsMap)
+	if err != nil {
+		return fmt.Errorf("error unmarshalling settings for inbound ID %d: %w", inboundID, err)
+	}
+
+	clientsRaw, ok := settingsMap["clients"]
+	if !ok {
+		return fmt.Errorf("no 'clients' field in settings for inbound ID %d", inboundID)
+	}
+
+	clients, ok := clientsRaw.([]interface{})
+	if !ok {
+		return fmt.Errorf("'clients' field is not an array in settings for inbound ID %d", inboundID)
+	}
+
+	clientFound := false
+	for i, clientInterface := range clients {
+		clientMap, ok := clientInterface.(map[string]interface{})
+		if !ok {
+			logger.Warningf("Client entry is not a map for inbound ID %d, index %d", inboundID, i)
+			continue
+		}
+
+		// Try to match by email first
+		clientEmail, emailOk := clientMap["email"].(string)
+		if emailOk && clientEmail == clientIdentifier {
+			clientMap["deviceFingerprints"] = deviceFingerprintsJSON
+			clients[i] = clientMap
+			clientFound = true
+			break
+		}
+
+		// If not matched by email, try to match by ID (for vmess/vless etc.)
+		clientID, idOk := clientMap["id"].(string)
+		if idOk && clientID == clientIdentifier {
+			clientMap["deviceFingerprints"] = deviceFingerprintsJSON
+			clients[i] = clientMap
+			clientFound = true
+			break
+		}
+		
+		// If not matched by email or ID, try to match by Password (for trojan etc.)
+		clientPassword, passwordOk := clientMap["password"].(string)
+		if passwordOk && clientPassword == clientIdentifier {
+			clientMap["deviceFingerprints"] = deviceFingerprintsJSON
+			clients[i] = clientMap
+			clientFound = true
+			break
+		}
+	}
+
+	if !clientFound {
+		return fmt.Errorf("client with identifier '%s' not found in inbound ID %d", clientIdentifier, inboundID)
+	}
+
+	settingsMap["clients"] = clients
+	updatedSettingsBytes, err := json.Marshal(settingsMap)
+	if err != nil {
+		return fmt.Errorf("error marshalling updated settings for inbound ID %d: %w", inboundID, err)
+	}
+
+	inbound.Settings = string(updatedSettingsBytes)
+	err = db.Save(&inbound).Error
+	if err != nil {
+		return fmt.Errorf("error saving updated inbound settings for ID %d: %w", inboundID, err)
+	}
+
+	logger.Infof("Successfully updated device fingerprints for client '%s' in inbound ID %d", clientIdentifier, inboundID)
 	return nil
 }
 
@@ -300,7 +406,7 @@ func (s *InboundService) AddInbound(inbound *model.Inbound) (*model.Inbound, boo
 	needRestart := false
 	if inbound.Enable {
 		s.xrayApi.Init(p.GetAPIPort())
-		inboundJson, err1 := json.MarshalIndent(inbound.GenXrayInboundConfig(), "", "  ")
+		inboundJson, err1 := json.MarshalIndent(s.genXrayInboundConfig(inbound), "", "  ")
 		if err1 != nil {
 			logger.Debug("Unable to marshal inbound config:", err1)
 		}
@@ -428,7 +534,7 @@ func (s *InboundService) UpdateInbound(inbound *model.Inbound) (*model.Inbound, 
 		logger.Debug("Old inbound deleted by api:", tag)
 	}
 	if inbound.Enable {
-		inboundJson, err2 := json.MarshalIndent(oldInbound.GenXrayInboundConfig(), "", "  ")
+		inboundJson, err2 := json.MarshalIndent(s.genXrayInboundConfig(oldInbound), "", "  ")
 		if err2 != nil {
 			logger.Debug("Unable to marshal updated inbound config:", err2)
 			needRestart = true

@@ -3,9 +3,12 @@ package service
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 
+	"x-ui/database/model"
 	"x-ui/logger"
+	"x-ui/util/json_util"
 	"x-ui/xray"
 
 	"go.uber.org/atomic"
@@ -17,6 +20,24 @@ var (
 	isNeedXrayRestart atomic.Bool
 	result            string
 )
+
+// genXrayInboundConfig generates xray.InboundConfig from model.Inbound
+func genXrayInboundConfig(i *model.Inbound) *xray.InboundConfig {
+	listen := i.Listen
+	if listen != "" {
+		listen = fmt.Sprintf("\"%v\"", listen)
+	}
+	return &xray.InboundConfig{
+		Listen:         json_util.RawMessage(listen),
+		Port:           i.Port,
+		Protocol:       string(i.Protocol),
+		Settings:       json_util.RawMessage(i.Settings),
+		StreamSettings: json_util.RawMessage(i.StreamSettings),
+		Tag:            i.Tag,
+		Sniffing:       json_util.RawMessage(i.Sniffing),
+		Allocate:       json_util.RawMessage(i.Allocate),
+	}
+}
 
 type XrayService struct {
 	inboundService InboundService
@@ -157,7 +178,7 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 			inbound.StreamSettings = string(newStream)
 		}
 
-		inboundConfig := inbound.GenXrayInboundConfig()
+		inboundConfig := genXrayInboundConfig(&inbound)
 		xrayConfig.InboundConfigs = append(xrayConfig.InboundConfigs, *inboundConfig)
 	}
 	return xrayConfig, nil
