@@ -178,7 +178,7 @@ func (s *XrayService) GetXrayConfig() (*xray.Config, error) {
 			inbound.StreamSettings = string(newStream)
 		}
 
-		inboundConfig := genXrayInboundConfig(&inbound)
+		inboundConfig := genXrayInboundConfig(inbound)
 		xrayConfig.InboundConfigs = append(xrayConfig.InboundConfigs, *inboundConfig)
 	}
 	return xrayConfig, nil
