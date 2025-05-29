@@ -294,6 +294,7 @@ func (j *CheckClientIpJob) processLogFile() bool {
 							}
 						}
 					}
+				}
 			case "hybrid":
 				// 混合模式：优先使用指纹，回退到IP
 				if len(currentFingerprints) > 0 {
