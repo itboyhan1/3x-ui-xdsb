@@ -123,9 +123,6 @@ func (s *InboundService) UpdateClientActiveIPsInDB(inboundID int, clientIdentifi
 	return nil
 }
 
-	return nil
-}
-
 // UpdateClientDeviceFingerprintsInDB 更新客户端设备指纹到数据库
 func (s *InboundService) UpdateClientDeviceFingerprintsInDB(inboundID int, clientIdentifier string, deviceFingerprintsJSON string) error {
 	db := database.GetDB()
