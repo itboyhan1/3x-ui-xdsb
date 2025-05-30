@@ -64,6 +64,11 @@ func (x *XrayAPI) Close() {
 }
 
 func (x *XrayAPI) AddInbound(inbound []byte) error {
+	if x.HandlerServiceClient == nil {
+		return common.NewError("xray HandlerServiceClient is not initialized")
+	}
+	
+	// Store the client in a local variable to avoid race condition
 	client := *x.HandlerServiceClient
 
 	conf := new(conf.InboundDetourConfig)
@@ -85,6 +90,11 @@ func (x *XrayAPI) AddInbound(inbound []byte) error {
 }
 
 func (x *XrayAPI) DelInbound(tag string) error {
+	if x.HandlerServiceClient == nil {
+		return common.NewError("xray HandlerServiceClient is not initialized")
+	}
+	
+	// Store the client in a local variable to avoid race condition
 	client := *x.HandlerServiceClient
 	_, err := client.RemoveInbound(context.Background(), &command.RemoveInboundRequest{
 		Tag: tag,
@@ -138,6 +148,11 @@ func (x *XrayAPI) AddUser(Protocol string, inboundTag string, user map[string]an
 		return nil
 	}
 
+	if x.HandlerServiceClient == nil {
+		return common.NewError("xray HandlerServiceClient is not initialized")
+	}
+	
+	// Store the client in a local variable to avoid race condition
 	client := *x.HandlerServiceClient
 
 	_, err := client.AlterInbound(context.Background(), &command.AlterInboundRequest{
@@ -153,8 +168,15 @@ func (x *XrayAPI) AddUser(Protocol string, inboundTag string, user map[string]an
 }
 
 func (x *XrayAPI) RemoveUser(inboundTag, email string) error {
+	if x.HandlerServiceClient == nil {
+		return common.NewError("xray HandlerServiceClient is not initialized")
+	}
+	
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+
+	// Store the client in a local variable to avoid race condition
+	client := *x.HandlerServiceClient
 
 	op := &command.RemoveUserOperation{Email: email}
 	req := &command.AlterInboundRequest{
@@ -162,7 +184,7 @@ func (x *XrayAPI) RemoveUser(inboundTag, email string) error {
 		Operation: serial.ToTypedMessage(op),
 	}
 
-	_, err := (*x.HandlerServiceClient).AlterInbound(ctx, req)
+	_, err := client.AlterInbound(ctx, req)
 	if err != nil {
 		return fmt.Errorf("failed to remove user: %w", err)
 	}
@@ -185,7 +207,9 @@ func (x *XrayAPI) GetTraffic(reset bool) ([]*Traffic, []*ClientTraffic, error) {
 		return nil, nil, common.NewError("xray StatusServiceClient is not initialized")
 	}
 
-	resp, err := (*x.StatsServiceClient).QueryStats(ctx, &statsService.QueryStatsRequest{Reset_: reset})
+	// Store the client in a local variable to avoid race condition
+	statsClient := *x.StatsServiceClient
+	resp, err := statsClient.QueryStats(ctx, &statsService.QueryStatsRequest{Reset_: reset})
 	if err != nil {
 		logger.Debug("Failed to query Xray stats:", err)
 		return nil, nil, err
